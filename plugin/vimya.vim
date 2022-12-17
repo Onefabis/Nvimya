@@ -1,6 +1,7 @@
 """
 "
-" Coypright 2009, 2013-2014 Stefan Goebel - <vimya /at/ subtype /dot/ de>.
+" Coypright 2009, 2013-2014, 2018, 2021 Stefan Goebel - <vimya /at/ subtype /dot/ de>,
+"                                       Talha Ahmed   - <talha /dot/ ahmed /at/ gmail /dot/ com>.
 "
 " This program is free software: you can redistribute it and/or modify it under the terms of the
 " GNU General Public License as published by the Free Software Foundation, either version 3 of the
@@ -17,7 +18,7 @@
 
 """
 "
-" Vimya 0.5 - Execute buffer contents as MEL or Python scripts in Autodesk Maya.
+" Vimya 0.6 - Execute buffer contents as MEL or Python scripts in Autodesk Maya.
 "
 " Help is available in doc/vimya.txt or from within Vim:
 "
@@ -29,10 +30,7 @@
 "
 """
 
-if exists ('g:vimyaLoaded') || &compatible || ! has ('python')
-    finish
-endif
-let g:vimyaLoaded = '0.5'
+let g:vimyaLoaded = '0.6'
 
 """
 " Configuration variables:
@@ -71,17 +69,18 @@ endif
 " Commands:
 """
 
-command -nargs=0 VimyaRun     :py vimyaRun  ()
-command -nargs=0 VimyaBuffer  :py vimyaRun  (forceBuffer = True    )
-command -nargs=1 VimyaCommand :py vimyaRun  (userCmd     = <q-args>)
-command -nargs=1 VimyaSend    :py vimyaSend ([<q-args>]            )
+command -nargs=0 VimyaRun     :py vimyaRun    ()
+command -nargs=0 VimyaBuffer  :py vimyaRun    (forceBuffer = True    )
+command -nargs=1 VimyaCommand :py vimyaRun    (userCmd     = <q-args>)
+command -nargs=1 VimyaSend    :py vimyaSend   ([<q-args>]            )
+command -nargs=? VimyaWhatIs  :py vimyaWhatIs (<q-args>              )
 
 """
 " Main stuff (most of it is Python):
 """
 
 let g:vimyaTailAvailable = 0
-if exists ('g:Tail_Loaded')
+if exists (':Tail')
     let g:vimyaTailAvailable = 1
 endif
 
@@ -94,7 +93,8 @@ import platform
 import socket
 import tempfile
 import time
-import vim
+import neovim
+import re
 
 # Global variables:
 #
@@ -222,6 +222,34 @@ def __vimyaFixPath (filename):
     else:
         return filename
 
+def __vimyaFindBuffer(path):
+
+    """Find the buffer and tab that contains the given path.
+
+    __vimyaFindBuffer (string) : (int, int)
+
+    This function will return the number of the tab page and the buffer number in which the
+    specified file is opened. Note: Searching will stop on first match!
+
+    Returns a tuple: (tabNumber, bufferNumber). If the path is empty or not opened in any buffer,
+    this function returns the tuple (0, 0) or (0, -1), respectively. If there is a buffer for log
+    file, but it is not opened in any window (and thus in no tab), the return value will be
+    (0, bufferNumber).
+    """
+
+    if path != '':
+        bufferIndex  = int (vim.eval ('bufnr     ("%s")' % __vimyaEscape (path, '\\"')))
+        bufferExists = int (vim.eval ('bufexists ( %d )' % int           (bufferIndex          )))
+        if bufferExists:
+            tabNum = int (vim.eval ('tabpagenr ("$")'))
+            for tabIndex in range (1, tabNum + 1):
+                tabBuffers = vim.eval ('tabpagebuflist (%d)' % tabIndex)
+                if str (bufferIndex) in tabBuffers:
+                    return (tabIndex, bufferIndex)
+        return (0, bufferIndex)
+
+    return (0, 0)
+
 def __vimyaFindLog ():
 
     """Find the buffer and tab that contains the Maya log.
@@ -234,24 +262,121 @@ def __vimyaFindLog ():
     this is not checked, the buffer found may be a regular window!
 
     Returns a tuple: (tabNumber, bufferNumber). If the log file is not set or not opened in any
-    buffer, this function returns the tuple (0, 0). If there is a buffer for the log file, but it
-    is not opened in any window (and thus in no tab), the return value will be (0, bufferNumber).
+    buffer, this function returns the tuple (0, 0) or (0, -1), respectively. If there is a buffer
+    for the log file, but it is not opened in any window (and thus in no tab), the return value
+    will be (0, bufferNumber).
     """
 
     global __vimyaLogPath
+    return __vimyaFindBuffer(__vimyaLogPath)
 
-    if __vimyaLogPath != '':
-        bufferIndex  = int (vim.eval ('bufnr     ("%s")' % __vimyaEscape (__vimyaLogPath, '\\"')))
-        bufferExists = int (vim.eval ('bufexists ( %d )' % int           (bufferIndex          )))
-        if bufferExists:
-            tabNum = int (vim.eval ('tabpagenr ("$")'))
-            for tabIndex in range (1, tabNum + 1):
-                tabBuffers = vim.eval ('tabpagebuflist (%d)' % tabIndex)
-                if str (bufferIndex) in tabBuffers:
-                    return (tabIndex, bufferIndex)
-        return (0, bufferIndex)
+def __vimyaGetLastLine(path, force_read=False):
 
-    return (0, 0)
+    """Return the last line of the specified file.
+
+    __vimyaGetLastLine (string, force_read = False) : str
+
+    If the specified file is currently open in any buffer, the last line will be read from the
+    buffer, unless force_read is set to True, in which case it is read from the filesystem
+    regardless. If no buffer contains the file, it is read from the filesystem.
+    """
+
+    bufferIndex  = int (vim.eval ('bufnr     ("%s")' % __vimyaEscape (path, '\\"')))
+    last_line = ''
+
+
+    if force_read or bufferIndex == -1:
+        # reading last line
+        if os.path.isfile(path):
+            size = os.path.getsize(path)
+            with open(path, "rb") as _file:
+                _file.seek(size, os.SEEK_SET)
+                next_byte = _file.read(1)
+                while next_byte != b"\n":
+                    try:
+                        _file.seek(-2, os.SEEK_CUR)
+                    except IOError:
+                        _file.seek(0, os.SEEK_SET)
+                        break
+                    next_byte = _file.read(1)
+                last_line = _file.readline()
+
+    else:
+        last_line = vim.buffers[bufferIndex][-1]
+
+    return last_line
+
+def vimyaWhatIs(keyword=None):
+
+    """Open (or switch to) a buffer containing the procedure specified by the keyword.
+
+    vimyaWhatIs () : None
+
+    This function will take the given argument, or, in its absence, the current word under the
+    cursor, and pass it to Maya's `whatIs` procedure. It will open the path provided in the
+    response (as read from the log file) in a new buffer, or switch to the respective window if
+    there already is a buffer for the file.
+
+    If any information is provided by the `whatIs` command it is `echom`ed.
+    """
+
+    __vimyaError(keyword)
+
+    if not keyword:
+        keyword = vim.eval('expand("<cword>")')
+        keyWORD = vim.eval('expand("<cWORD>")')
+        if '$'+keyword in keyWORD:
+            keyword = '$' + keyword
+
+    if not keyword or not re.match("\$?[A-Za-z_](0-9A-Za-z_)*", keyword):
+        __vimyaError("No valid keyword found");
+        return
+
+    # output whatIs info with tag to avoid confusion with any previous lines
+    cmds = ['string $vimya_kw="%s";' % keyword,
+            'string $vimya_res=`whatIs $vimya_kw`;',
+            'print `format -s $vimya_kw -s $vimya_res "\\n^1s:^2s"`;']
+
+    ft = vim.eval('&ft')
+    vim.command('setl ft=mel')
+    success = vimyaRun(userCmd=''.join(cmds))
+    vim.command('setl ft=%s' % ft)
+
+    response = __vimyaGetLastLine(
+            __vimyaLogPath, not success or bool(vim.eval('g:vimyaForceRefresh')))
+
+    info = ''
+    info_pattern = '%s:(.*)' % keyword
+    match = re.match(info_pattern, response)
+    if match:
+        info = match.group(1)
+
+    mel_path = ''
+    found_pattern = '%s:Mel procedure found in: (.*)' % keyword
+    match = re.match(found_pattern, response)
+    if match:
+        mel_path = match.group(1)
+
+    if info:
+        vim.command('echom "%s:%s"' % (keyword, info.replace('"', '\\"' )))
+
+    if mel_path:
+        tabIndex, bufferIndex = __vimyaFindBuffer(mel_path)
+
+        if not tabIndex:
+            if bufferIndex < 1:
+                vim.command ('e %s' % mel_path)
+            else:
+                vim.command ('b %d' % bufferIndex)
+        else:
+            vim.command ('tabnext %d' % tabIndex)
+            winIndex = int (vim.eval ('bufwinnr (%d)' % bufferIndex))
+            vim.command('wincmd t')
+            vim.command('%dwincmd w' % winIndex)
+
+        vim.eval('search("\\\\Cproc.*%s\\\\s*\\\\((\\\\|$\\\\)", "w")' % keyword)
+
+        vim.command('normal! zz')
 
 def vimyaRefreshLog ():
 
@@ -427,7 +552,7 @@ def vimyaSend (commands):
     try:
         try:
             for command in commands:
-                connection.send ('%s\n' % command)
+                connection.send ((command+'\n').encode())
                 sent = sent + 1
         except socket.error as e:
             __vimyaError ('Sending a command failed: %s' % str (e))
@@ -469,7 +594,7 @@ def vimyaRun (forceBuffer = False, userCmd = None):
 
     global __vimyaLogPath, __vimyaTempFiles
 
-    filetype = vim.eval ('&g:filetype')
+    filetype = vim.eval ('&filetype')
     if filetype not in ['', 'mel', 'python']:
         return __vimyaError ('Error: Supported filetypes: "python", "mel", None.')
 
@@ -488,16 +613,16 @@ def vimyaRun (forceBuffer = False, userCmd = None):
 
     try:
         if userCmd:
-            os.write (tmpHandle, '%s\n' % userCmd)
+            os.write (tmpHandle, (userCmd+'\n').encode())
         else:
             vStart = vim.current.buffer.mark ('<')
             if (vStart is None) or (forceBuffer):
                 for line in vim.current.buffer:
-                    os.write (tmpHandle, '%s\n' % line)
+                    os.write (tmpHandle, (line+'\n').encode())
             else:
                 vEnd = vim.current.buffer.mark ('>')
                 for line in vim.current.buffer [vStart [0] - 1 : vEnd [0]]:
-                    os.write (tmpHandle, '%s\n' % line)
+                    os.write (tmpHandle, (line+'\n').encode())
     finally:
         os.close (tmpHandle)
 
