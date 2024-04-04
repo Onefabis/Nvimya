@@ -328,7 +328,7 @@ def vimyaWhatIs(keyword=None):
         if '$'+keyword in keyWORD:
             keyword = '$' + keyword
 
-    if not keyword or not re.match("\$?[A-Za-z_](0-9A-Za-z_)*", keyword):
+    if not keyword or not re.match("\\$?[A-Za-z_](0-9A-Za-z_)*", keyword):
         __vimyaError("No valid keyword found");
         return
 
